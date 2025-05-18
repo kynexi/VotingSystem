@@ -1,16 +1,13 @@
-/** 
- * Global configuration for the application 
- */ 
-const CONFIG = { 
-  API_URL: 'http://localhost:8080/api', 
-  TOKEN_KEY: 'authToken', 
-  ROUTES: { 
-    HOME: '/index.html', 
-    LOGIN: '/pages/auth/login.html', 
-    REGISTER: '/pages/auth/register.html', 
-    ADMIN: '/pages/admin/dashboard.html', 
-    VOTER: '/pages/voting/vote.html' 
-  } 
-}; 
+const CONFIG = {
+  API_URL: "http://localhost:8080",
+  TOKEN_KEY: "authToken",
+  ROUTES: {
+    HOME: "/",
+    LOGIN: "/login",
+    REGISTER: "/register",
+    ADMIN: "/admin",
+    VOTER: "/vote",
+  },
+};
 
 export default CONFIG;

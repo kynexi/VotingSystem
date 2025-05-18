@@ -33,6 +33,7 @@ const int PASSWORD_MIN_LENGTH = 8;
 // In-memory session store: token -> {user_id, expiry_time}
 struct SessionInfo {
     int user_id;
+    bool is_admin;             // new field
     std::chrono::time_point<std::chrono::system_clock> expiry;
     std::string user_ip;
 };
@@ -48,7 +49,9 @@ static std::mutex login_mutex;
 
 // Config
 static std::string encryption_key;
-static bool voting_open = true;
+static bool voting_open = false;
+static std::string election_start;
+static std::string election_end;
 
 // Helper: SHA-256 → hex
 std::string sha256(const std::string &in) {
@@ -59,6 +62,20 @@ std::string sha256(const std::string &in) {
         os << std::hex << std::setw(2) << std::setfill('0') << (int)b;
     }
     return os.str();
+}
+
+// Helper: determine if elections have ended.
+// Assumes election_end is in ISO format "YYYY-MM-DDTHH:MM" (local time)
+
+bool electionsEnded() {
+    if(election_end.empty()) return false;
+    std::tm tm = {};
+    std::istringstream ss(election_end);
+    ss >> std::get_time(&tm, "%Y-%m-%dT%H:%M");
+    if(ss.fail()) return false;
+    std::time_t end_time = std::mktime(&tm);
+    std::time_t now = std::time(nullptr);
+    return now >= end_time;
 }
 
 // Helper: PBKDF2 for password hashing with salt
@@ -182,6 +199,27 @@ std::string decrypt_data(const std::string &ciphertext_b64, const std::string &k
     return std::string(plaintext.begin(), plaintext.begin() + plaintext_len);
 }
 
+bool isVotingOpen() {
+    if (election_start.empty() || election_end.empty()) 
+        return voting_open;
+        
+    std::tm tm_start = {}, tm_end = {}, tm_now = {};
+    std::time_t now = std::time(nullptr);
+    tm_now = *std::localtime(&now);
+    
+    std::istringstream ss_start(election_start), ss_end(election_end);
+    ss_start >> std::get_time(&tm_start, "%Y-%m-%dT%H:%M");
+    ss_end >> std::get_time(&tm_end, "%Y-%m-%dT%H:%M");
+    
+    if (ss_start.fail() || ss_end.fail()) 
+        return voting_open;
+        
+    std::time_t start_time = std::mktime(&tm_start);
+    std::time_t end_time = std::mktime(&tm_end);
+    
+    return voting_open && now >= start_time && now <= end_time;
+}
+
 // Helper: parse JSON-like body for one field (very naive!)
 std::string extract_field(const std::string &body, const std::string &field) {
     auto pos = body.find("\"" + field + "\":");
@@ -270,6 +308,26 @@ int get_user_id_from_token(const std::string &token) {
         return -1;
     }
     return it->second.user_id;
+}
+
+bool require_admin(const Request &req, Response &res) {
+    std::string auth = req.get_header_value("Authorization");
+    if(auth.rfind("Bearer ", 0) != 0) {
+        json_res(res, false, "Missing or invalid auth header");
+        return false;
+    }
+    std::string token = auth.substr(7);
+    int uid = get_user_id_from_token(token);
+    if(uid == -1) {
+        json_res(res, false, "Invalid or expired token");
+        return false;
+    }
+    auto sit = sessions.find(token);
+    if(sit == sessions.end() || !sit->second.is_admin) {
+        json_res(res, false);
+        return false;
+    }
+    return true;
 }
 
 // Helper: Check password strength
@@ -400,12 +458,20 @@ int main() {
         std::cerr << "DB error: " << sqlite3_errmsg(db) << "\n";
         return 1;
     }
+
+    // In the main() function, after the database tables creation:
+
+    // Add after database tables creation and before server.listen():
+
+    // Add test voter to valid_voters table
+
     
     // 2) Init tables
     const char *init_sql = R"sql(
       CREATE TABLE IF NOT EXISTS users (
         id             INTEGER PRIMARY KEY,
         user           TEXT UNIQUE,
+        candidate_id   INTEGER,                
         pass           TEXT,
         salt           TEXT,
         email          TEXT,
@@ -413,17 +479,25 @@ int main() {
         name           TEXT,
         recovery_code  TEXT,
         physical_only  INTEGER DEFAULT 0,
+        is_admin       INTEGER DEFAULT 0,  
         created_at     DATETIME DEFAULT CURRENT_TIMESTAMP
-      );
-      
+);
+
+      CREATE TABLE IF NOT EXISTS candidates (
+        id     INTEGER PRIMARY KEY AUTOINCREMENT,
+        name   TEXT NOT NULL,
+        party  TEXT NOT NULL
+        );
+            
       CREATE TABLE IF NOT EXISTS votes (
-        id            INTEGER PRIMARY KEY,
-        user_id       INTEGER UNIQUE,
-        choice        TEXT,
-        physical_vote INTEGER DEFAULT 0,
-        ts            DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (user_id) REFERENCES users(id)
-      );
+        id             INTEGER PRIMARY KEY,
+        user_id        INTEGER UNIQUE,
+        candidate_id   INTEGER,
+        physical_vote  INTEGER DEFAULT 0,
+        ts             DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(user_id) REFERENCES users(id),
+        FOREIGN KEY(candidate_id) REFERENCES candidates(id)
+        );
       
       CREATE TABLE IF NOT EXISTS activity_log (
         id          INTEGER PRIMARY KEY,
@@ -449,6 +523,11 @@ int main() {
         expires      DATETIME,
         FOREIGN KEY (user_id) REFERENCES users(id)
       );
+
+      CREATE TABLE IF NOT EXISTS config (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    );
       
       CREATE INDEX IF NOT EXISTS idx_user_idnp ON users(user);
       CREATE INDEX IF NOT EXISTS idx_votes_user ON votes(user_id);
@@ -456,7 +535,44 @@ int main() {
     )sql";
     
     sqlite3_exec(db, init_sql, nullptr, nullptr, nullptr);
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(db, "SELECT value FROM config WHERE key = 'voting_open';", -1, &st, nullptr) == SQLITE_OK) {
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            std::string value = reinterpret_cast<const char*>(sqlite3_column_text(st, 0));
+            voting_open = (value == "1");
+        }
+        sqlite3_finalize(st);
+    }
+    // Load election times from DB
+    sqlite3_stmt *st_start, *st_end;
+    if (sqlite3_prepare_v2(db, "SELECT value FROM config WHERE key = 'election_start';", -1, &st_start, nullptr) == SQLITE_OK) {
+        if (sqlite3_step(st_start) == SQLITE_ROW) {
+            election_start = reinterpret_cast<const char*>(sqlite3_column_text(st_start, 0));
+        }
+        sqlite3_finalize(st_start);
+    }
+
+    if (sqlite3_prepare_v2(db, "SELECT value FROM config WHERE key = 'election_end';", -1, &st_end, nullptr) == SQLITE_OK) {
+        if (sqlite3_step(st_end) == SQLITE_ROW) {
+            election_end = reinterpret_cast<const char*>(sqlite3_column_text(st_end, 0));
+        }
+        sqlite3_finalize(st_end);
+    }
+
+
+    std::string admin_pass = "Test123!@#";
+    std::string admin_salt = "5b4240772cd58255";
+    std::string admin_hashed = pbkdf2_hash(admin_pass, admin_salt);
+
+    std::string test_admin_sql = "INSERT OR IGNORE INTO users(user, pass, salt, email, is_admin) "
+                             "VALUES('1234567890123', '" + admin_hashed + "', '5b4240772cd58255', "
+                             "'admin@test.com', 1);";
+    sqlite3_exec(db, test_admin_sql.c_str(), nullptr, nullptr, nullptr);
+    // 4) Then add test admin account
+
     
+
+
     // Generate encryption key from random source or load from config
     encryption_key = sha256(random_token(32));
     
@@ -473,20 +589,21 @@ int main() {
     svr.set_write_timeout(5, 0);
     
     // Add CORS headers for API access from different platforms
+// Set CORS headers to allow requests only from your React app's origin
+
     svr.set_default_headers({
         {"Access-Control-Allow-Origin", "*"},
         {"Access-Control-Allow-Methods", "GET, POST, OPTIONS"},
         {"Access-Control-Allow-Headers", "Content-Type, Authorization"}
     });
-    
-    // Handler for OPTIONS requests (CORS preflight)
-    svr.Options("/(.*)", [](const Request&, Response& res) {
+
+    svr.Options(".*", [](const Request&, Response &res) {
         res.set_header("Access-Control-Allow-Origin", "*");
         res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
         res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization");
         res.set_header("Access-Control-Max-Age", "86400");
         res.set_content("", "text/plain");
-    });
+    }); 
 
     //
     // REGISTER
@@ -529,10 +646,10 @@ int main() {
         }
         
         // 5. Check if valid voter
-        if (!is_valid_voter(db, user)) {
-            log_activity(db, "registration attempt - not a valid voter", -1, client_ip, false);
-            return json_res(res, false, "This IDNP is not registered in the voter database");
-        }
+        // if (!is_valid_voter(db, user)) {
+        //     log_activity(db, "registration attempt - not a valid voter", -1, client_ip, false);
+        //     return json_res(res, false, "This IDNP is not registered in the voter database");
+        // }
         
         // 6. Password strength
         if (!is_strong_password(pass)) {
@@ -576,6 +693,20 @@ int main() {
         // Get user ID for logging
         int user_id = sqlite3_last_insert_rowid(db);
         sqlite3_finalize(st);
+
+        // Add user to valid_voters table
+        sqlite3_stmt *st_valid;
+        sqlite3_prepare_v2(db,
+            "INSERT OR IGNORE INTO valid_voters(idnp, name) VALUES(?, ?);",
+            -1, &st_valid, nullptr);
+
+        sqlite3_bind_text(st_valid, 1, user.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st_valid, 2, name.c_str(), -1, SQLITE_TRANSIENT);
+
+        if (sqlite3_step(st_valid) != SQLITE_DONE) {
+            log_activity(db, "registration warning - failed to add to valid_voters", user_id, client_ip, false);
+        }
+        sqlite3_finalize(st_valid);
         
         // Log successful registration
         log_activity(db, "registration successful", user_id, client_ip, true);
@@ -589,132 +720,144 @@ int main() {
         );
     });
 
+    
     //
     // LOGIN → issues session token
     //
     svr.Post("/login", [&](const Request& req, Response &res) {
-        std::regex idnp_re("^[0-9]{13}$");
-        auto client_ip = req.remote_addr;
-        
-        auto user = extract_field(req.body, "user");
-        auto pass = extract_field(req.body, "pass");
-        auto captcha = extract_field(req.body, "captcha");
-    
-        if (!std::regex_match(user, idnp_re)) {
-            log_activity(db, "login attempt - invalid IDNP format", -1, client_ip, false);
-            return json_res(res, false, "IDNP must be exactly 13 digits");
-        }
-        
-        if (!std::regex_match(captcha, idnp_re)) {
-            log_activity(db, "login attempt - invalid captcha", -1, client_ip, false);
-            return json_res(res, false, "Captcha must be exactly 13 numbers");
-        }
-        
-        if (user.empty() || pass.empty()) {
-            log_activity(db, "login attempt - missing credentials", -1, client_ip, false);
-            return json_res(res, false, "IDNP and password required");
-        }
-        
-        // Check if account is locked due to failed attempts
-        {
-            std::lock_guard<std::mutex> lock(login_mutex);
-            auto it = failed_logins.find(user);
-            if (it != failed_logins.end() && 
-                it->second.count >= MAX_LOGIN_ATTEMPTS && 
-                it->second.lockout_until > std::chrono::system_clock::now()) {
-                
-                auto now = std::chrono::system_clock::now();
-                auto lockout_mins = std::chrono::duration_cast<std::chrono::minutes>(
-                    it->second.lockout_until - now).count();
-                
-                log_activity(db, "login attempt - account locked", -1, client_ip, false);
-                return json_res(res, false, 
-                    "Account temporarily locked. Try again in " + 
-                    std::to_string(lockout_mins) + " minutes.");
-            }
-        }
-        
-        // Check if physical-only voter
-        sqlite3_stmt *st_phys;
-        sqlite3_prepare_v2(db,
-            "SELECT physical_only FROM users WHERE user=?;",
-            -1, &st_phys, nullptr);
-        sqlite3_bind_text(st_phys, 1, user.c_str(), -1, SQLITE_TRANSIENT);
-        
-        if (sqlite3_step(st_phys) == SQLITE_ROW) {
-            int physical_only = sqlite3_column_int(st_phys, 0);
-            if (physical_only == 1) {
-                sqlite3_finalize(st_phys);
-                log_activity(db, "login attempt - physical voter only", -1, client_ip, false);
-                return json_res(res, false, "This voter has already voted in person at a physical location");
-            }
-        }
-        sqlite3_finalize(st_phys);
-        
-        // Get salt and stored password hash
-        sqlite3_stmt *st;
-        sqlite3_prepare_v2(db,
-            "SELECT id, pass, salt FROM users WHERE user=?;",
-            -1, &st, nullptr);
-        sqlite3_bind_text(st, 1, user.c_str(), -1, SQLITE_TRANSIENT);
-        
-        if (sqlite3_step(st) == SQLITE_ROW) {
-            int uid = sqlite3_column_int(st, 0);
-            std::string stored_hash = 
-                reinterpret_cast<const char*>(sqlite3_column_text(st, 1));
-            std::string salt = 
-                reinterpret_cast<const char*>(sqlite3_column_text(st, 2));
+    res.set_header("Access-Control-Allow-Origin", "*");
+    res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+
+    std::regex idnp_re("^[0-9]{13}$");
+    auto client_ip = req.remote_addr;
+    auto user = extract_field(req.body, "user");
+    auto pass = extract_field(req.body, "pass");
+    auto captcha = extract_field(req.body, "captcha");
+
+    if (!std::regex_match(user, idnp_re)) {
+        log_activity(db, "login attempt - invalid IDNP format", -1, client_ip, false);
+        json_res(res, false, "IDNP must be exactly 13 digits");
+        return;
+    }
+    if (!std::regex_match(captcha, idnp_re)) {
+        log_activity(db, "login attempt - invalid captcha", -1, client_ip, false);
+        json_res(res, false, "Captcha must be exactly 13 numbers");
+        return;
+    }
+    if (user.empty() || pass.empty()) {
+        log_activity(db, "login attempt - missing credentials", -1, client_ip, false);
+        json_res(res, false, "IDNP and password required");
+        return;
+    }
+
+    // Check if physical-only voter or admin branch using st_phys:
+    sqlite3_stmt *st_phys;
+    if (sqlite3_prepare_v2(db,
+          "SELECT id, pass, salt, is_admin FROM users WHERE user=?;",
+          -1, &st_phys, nullptr) != SQLITE_OK) {
+        json_res(res, false, "Database error");
+        return;
+    }
+    sqlite3_bind_text(st_phys, 1, user.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st_phys) == SQLITE_ROW) {
+        int uid = sqlite3_column_int(st_phys, 0);
+        std::string stored_hash = reinterpret_cast<const char*>(sqlite3_column_text(st_phys, 1));
+        std::string salt = reinterpret_cast<const char*>(sqlite3_column_text(st_phys, 2));
+        bool is_admin = (sqlite3_column_int(st_phys, 3) != 0);
+        std::string calculated_hash = pbkdf2_hash(pass, salt);
+        if (calculated_hash == stored_hash) {
+            sqlite3_finalize(st_phys);
+            auto token = random_token(16);
+            auto expiry = std::chrono::system_clock::now() + std::chrono::minutes(TOKEN_EXPIRY_MINUTES);
+            sessions[token] = SessionInfo{uid, is_admin, expiry, client_ip};
             
-            // Hash the provided password with the stored salt
-            std::string calculated_hash = pbkdf2_hash(pass, salt);
-            
-            if (calculated_hash == stored_hash) {
-                sqlite3_finalize(st);
+            // Update the response format
+            std::ostringstream out;
+            out << "{ \"ok\": true,"
+                << "\"token\": \"" << token << "\","
+                << "\"is_admin\": " << (is_admin ? "true" : "false") << ","
+                << "\"user_id\": " << uid << "}";
                 
-                // Reset failed login attempts
-                {
-                    std::lock_guard<std::mutex> lock(login_mutex);
-                    failed_logins.erase(user);
-                }
-                
-                // Create new token with expiration time
-                auto token = random_token(16);
-                auto expiry = std::chrono::system_clock::now() + 
-                  std::chrono::minutes(TOKEN_EXPIRY_MINUTES);
-                
-                // Store session info
-                sessions[token] = SessionInfo{uid, expiry, client_ip};
-                
-                // Log successful login
-                log_activity(db, "login successful", uid, client_ip, true);
-                
-                return json_res(res, true, "", token);
-            }
-            
-            // Failed login, increment counter
+            res.set_header("Content-Type", "application/json");
+            res.set_content(out.str(), "application/json");
+            return;
+        }
+    }
+    sqlite3_finalize(st_phys);
+
+    // Try alternate branch for non‑admin users:
+    sqlite3_stmt *st_alt;
+    if (sqlite3_prepare_v2(db,
+          "SELECT id, pass, salt FROM users WHERE user=?;",
+          -1, &st_alt, nullptr) != SQLITE_OK) {
+        json_res(res, false, "Database error");
+        return;
+    }
+    sqlite3_bind_text(st_alt, 1, user.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st_alt) == SQLITE_ROW) {
+        int uid = sqlite3_column_int(st_alt, 0);
+        std::string stored_hash = reinterpret_cast<const char*>(sqlite3_column_text(st_alt, 1));
+        std::string salt = reinterpret_cast<const char*>(sqlite3_column_text(st_alt, 2));
+        std::string calculated_hash = pbkdf2_hash(pass, salt);
+        if (calculated_hash == stored_hash) {
+            sqlite3_finalize(st_alt);
             {
                 std::lock_guard<std::mutex> lock(login_mutex);
-                auto &attempts = failed_logins[user];
-                attempts.count++;
-                
-                // If max attempts reached, set lockout time
-                if (attempts.count >= MAX_LOGIN_ATTEMPTS) {
-                    attempts.lockout_until = std::chrono::system_clock::now() + 
-                      std::chrono::minutes(LOCKOUT_MINUTES);
-                    
-                    log_activity(db, "login failed - account locked", uid, client_ip, false);
-                    sqlite3_finalize(st);
-                    return json_res(res, false, 
-                      "Too many failed attempts. Account locked for " + 
-                      std::to_string(LOCKOUT_MINUTES) + " minutes.");
-                }
+                failed_logins.erase(user);
             }
+            auto token = random_token(16);
+            auto expiry = std::chrono::system_clock::now() + std::chrono::minutes(TOKEN_EXPIRY_MINUTES);
+            sessions[token] = SessionInfo{uid, false, expiry, client_ip};
+            log_activity(db, "login successful", uid, client_ip, true);
+            
+            // Update the response format
+            std::ostringstream out;
+            out << "{ \"ok\": true,"
+                << "\"token\": \"" << token << "\","
+                << "\"is_admin\": false,"
+                << "\"user_id\": " << uid << "}";
+                
+            res.set_header("Content-Type", "application/json");
+            res.set_content(out.str(), "application/json");
+            return;
         }
-        
+    }
+    sqlite3_finalize(st_alt);
+
+    // Increment failure counter and respond:
+    {
+        std::lock_guard<std::mutex> lock(login_mutex);
+        auto &attempts = failed_logins[user];
+        attempts.count++;
+        if (attempts.count >= MAX_LOGIN_ATTEMPTS) {
+            attempts.lockout_until = std::chrono::system_clock::now() + std::chrono::minutes(LOCKOUT_MINUTES);
+            log_activity(db, "login failed - account locked", -1, client_ip, false);
+            json_res(res, false, "Too many failed attempts. Account locked for " + std::to_string(LOCKOUT_MINUTES) + " minutes.");
+            return;
+        }
+    }
+    log_activity(db, "login failed - invalid credentials", -1, client_ip, false);
+    json_res(res, false, "Invalid credentials");
+});
+
+    ////
+    /// Delete candidate
+
+    svr.Delete(R"(/admin/candidates/(\d+))", [&](const Request &req, Response &res) {
+        int cid = std::stoi(req.matches[1]);
+        sqlite3_stmt *st;
+        sqlite3_prepare_v2(db,
+            "DELETE FROM candidates WHERE id = ?;",
+            -1, &st, nullptr);
+        sqlite3_bind_int(st, 1, cid);
+        if (sqlite3_step(st) != SQLITE_DONE) {
+            sqlite3_finalize(st);
+            return json_res(res, false, "Failed to delete candidate");
+        }
         sqlite3_finalize(st);
-        log_activity(db, "login failed - invalid credentials", -1, client_ip, false);
-        return json_res(res, false, "Invalid credentials");
-    });
+        return json_res(res, true, "Candidate deleted");
+        });
     
     //
     // PASSWORD RESET REQUEST
@@ -1013,8 +1156,22 @@ int main() {
     //
     // VOTE → protected by Bearer token
     //
+    
+
     svr.Post("/vote", [&](const Request& req, Response &res) {
         auto client_ip = req.remote_addr;
+        auto token = req.get_header_value("Authorization").substr(7);
+        auto user_id = get_user_id_from_token(token);
+        if (user_id == -1) return json_res(res, false, "Invalid or expired token");
+
+        if (!isVotingOpen()) {
+        std::string message = "Voting is currently closed";
+        if (!election_start.empty()) {
+            message += ". Voting opens on " + election_start;
+        }
+        return json_res(res, false, message);
+    }
+
         
         // Check if voting is open
         if (!voting_open) {
@@ -1027,9 +1184,6 @@ int main() {
             log_activity(db, "vote attempt - missing auth", -1, client_ip, false);
             return json_res(res, false, "Missing or invalid auth header");
         }
-        
-        auto token = auth.substr(7);
-        auto user_id = get_user_id_from_token(token);
         
         if (user_id == -1) {
             log_activity(db, "vote attempt - invalid token", -1, client_ip, false);
@@ -1046,38 +1200,45 @@ int main() {
             return json_res(res, false, "Session invalid. Please login again.");
         }
 
-        // 2) choice
-        auto choice = extract_field(req.body, "choice");
-        if (choice != "A" && choice != "B") {
-            log_activity(db, "vote attempt - invalid choice", user_id, client_ip, false);
-            return json_res(res, false, "Invalid choice");
+    // 3) extract candidate ID (as a string)
+        auto choice_str = extract_field(req.body, "choice");
+        int candidate_id = 0;
+        try {
+            candidate_id = std::stoi(choice_str);
+        } catch (...) {
+            return json_res(res, false, "Invalid choice format");
         }
 
-        // 3) Check if already voted
-        if (has_voted(db, user_id)) {
-            log_activity(db, "vote attempt - already voted", user_id, client_ip, false);
-            return json_res(res, false, "You have already voted");
-        }
-
-        // 4) Insert vote
-        sqlite3_stmt *st;
+        // 4) ensure that ID exists in candidates table
+        sqlite3_stmt *st_check;
         sqlite3_prepare_v2(db,
-            "INSERT INTO votes(user_id, choice) VALUES(?,?);",
-            -1, &st, nullptr);
-        sqlite3_bind_int(st, 1, user_id);
-        sqlite3_bind_text(st, 2, choice.c_str(), -1, SQLITE_TRANSIENT);
-        
-        if (sqlite3_step(st) != SQLITE_DONE) {
-            sqlite3_finalize(st);
-            log_activity(db, "vote failed - database error", user_id, client_ip, false);
+            "SELECT 1 FROM candidates WHERE id = ?;",
+            -1, &st_check, nullptr);
+        sqlite3_bind_int(st_check, 1, candidate_id);
+        bool ok = (sqlite3_step(st_check) == SQLITE_ROW);
+        sqlite3_finalize(st_check);
+        if (!ok) {
+            return json_res(res, false, "Selected candidate does not exist");
+        }
+
+        // 5) Insert vote with candidate_id
+        sqlite3_stmt *st_vote;
+        sqlite3_prepare_v2(db,
+            "INSERT INTO votes(user_id, candidate_id) VALUES(?,?);",
+            -1, &st_vote, nullptr);
+        sqlite3_bind_int(st_vote, 1, user_id);
+        sqlite3_bind_int(st_vote, 2, candidate_id);
+
+        if (sqlite3_step(st_vote) != SQLITE_DONE) {
+            sqlite3_finalize(st_vote);
             return json_res(res, false, "Vote failed to register");
         }
+        sqlite3_finalize(st_vote);
         
-        sqlite3_finalize(st);
-        log_activity(db, "vote successful", user_id, client_ip, true);
-        return json_res(res, true, "Vote recorded successfully");
-    });
 
+        log_activity(db, "vote successful", user_id, req.remote_addr, true);
+        return json_res(res, true, "Vote recorded successfully");
+        });
     // 
     // CHECK VOTER STATUS
     //
@@ -1095,105 +1256,120 @@ int main() {
             return json_res(res, false, "Invalid or expired token");
         }
         
+        auto sit = sessions.find(token);
+        if (sit == sessions.end()) {
+            return json_res(res, false, "Invalid session");
+        }
+
         // Check if already voted
         bool voted = has_voted(db, user_id);
         
         // Get choice if voted
         std::string choice;
         if (voted) {
-            sqlite3_stmt *st;
+            sqlite3_stmt *st_vote;
             sqlite3_prepare_v2(db,
                 "SELECT choice, physical_vote FROM votes WHERE user_id = ?;",
-                -1, &st, nullptr);
-            sqlite3_bind_int(st, 1, user_id);
+                -1, &st_vote, nullptr);
+            sqlite3_bind_int(st_vote, 1, user_id);
             
-            if (sqlite3_step(st) == SQLITE_ROW) {
-                choice = reinterpret_cast<const char*>(sqlite3_column_text(st, 0));
-                int physical = sqlite3_column_int(st, 1);
+            if (sqlite3_step(st_vote) == SQLITE_ROW) {
+                choice = reinterpret_cast<const char*>(sqlite3_column_text(st_vote, 0));
+                int physical = sqlite3_column_int(st_vote, 1);
                 
                 if (physical == 1) {
                     choice = "Physical vote: " + choice;
                 }
             }
-            sqlite3_finalize(st);
+            sqlite3_finalize(st_vote);
         }
         
-        // Return status
-        res.set_header("Content-Type", "application/json");
+        // Get user details
+        sqlite3_stmt *st;
+        sqlite3_prepare_v2(db,
+            "SELECT u.id, u.user, u.name, vv.voting_area FROM users u "
+            "LEFT JOIN valid_voters vv ON u.user = vv.idnp "
+            "WHERE u.id = ?;",
+            -1, &st, nullptr);
+        sqlite3_bind_int(st, 1, user_id);
+        
         std::ostringstream out;
         out << "{ \"ok\": true, \"has_voted\": " << (voted ? "true" : "false");
+        
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            std::string name = sqlite3_column_text(st, 2) ? 
+                decrypt_data(reinterpret_cast<const char*>(sqlite3_column_text(st, 2)), encryption_key) : "";
+            std::string area = sqlite3_column_text(st, 3) ? 
+                reinterpret_cast<const char*>(sqlite3_column_text(st, 3)) : "";
+                
+            out << ", \"user_id\": " << sqlite3_column_int(st, 0)
+                << ", \"user\": \"" << reinterpret_cast<const char*>(sqlite3_column_text(st, 1)) << "\""
+                << ", \"name\": \"" << name << "\""
+                << ", \"voting_area\": \"" << area << "\""
+                << ", \"user_ip\": \"" << sit->second.user_ip << "\"";
+        }
+
         if (voted && !choice.empty()) {
             out << ", \"choice\": \"" << choice << "\"";
         }
         out << " }";
+        
+        sqlite3_finalize(st);
+        res.set_header("Content-Type", "application/json");
         res.set_content(out.str(), "application/json");
     });
 
     //
     // RESULTS
     //
-    svr.Get("/results", [&](const Request& req, Response &res) {
-        // Authentication required to view results
-        auto auth = req.get_header_value("Authorization");
-        if (auth.rfind("Bearer ", 0) != 0) {
+        svr.Get("/results", [&](const Request& req, Response &res) {
+        std::string auth = req.get_header_value("Authorization");
+        if(auth.rfind("Bearer ", 0) != 0)
             return json_res(res, false, "Authentication required to view results");
-        }
-        
-        auto token = auth.substr(7);
-        if (get_user_id_from_token(token) == -1) {
+        std::string token = auth.substr(7);
+        int uid = get_user_id_from_token(token);
+        if(uid == -1)
             return json_res(res, false, "Invalid or expired token");
-        }
+        auto sit = sessions.find(token);
+        bool is_admin = (sit != sessions.end() && sit->second.is_admin);
+        // If elections haven't ended and user isn't admin, disallow
+        if (!electionsEnded() && !is_admin)
+            return json_res(res, false, "Results are available only after election end");
         
+        // (Existing code to build results JSON remains unchanged)
         sqlite3_stmt *st;
         sqlite3_prepare_v2(db,
             "SELECT choice, physical_vote, COUNT(*) AS cnt FROM votes GROUP BY choice, physical_vote;",
             -1, &st, nullptr);
         
-        std::map<std::string, int> results;
-        std::map<std::string, int> physical_results;
-        std::map<std::string, int> online_results;
-        
+        std::map<std::string, int> results, physical_results, online_results;
         while (sqlite3_step(st) == SQLITE_ROW) {
-            std::string choice = 
-                reinterpret_cast<const char*>(sqlite3_column_text(st, 0));
+            std::string choice = reinterpret_cast<const char*>(sqlite3_column_text(st, 0));
             int physical = sqlite3_column_int(st, 1);
             int count = sqlite3_column_int(st, 2);
-            
             results[choice] += count;
-            
-            if (physical == 1) {
+            if (physical == 1)
                 physical_results[choice] += count;
-            } else {
+            else
                 online_results[choice] += count;
-            }
         }
         sqlite3_finalize(st);
         
-        // Get total voter count
+        // Total voters and votes counts (unchanged)
         sqlite3_stmt *st_total;
-        sqlite3_prepare_v2(db,
-            "SELECT COUNT(*) FROM valid_voters;",
-            -1, &st_total, nullptr);
-        
+        sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM valid_voters;", -1, &st_total, nullptr);
         int total_voters = 0;
-        if (sqlite3_step(st_total) == SQLITE_ROW) {
+        if (sqlite3_step(st_total) == SQLITE_ROW)
             total_voters = sqlite3_column_int(st_total, 0);
-        }
         sqlite3_finalize(st_total);
         
-        // Get total votes
         sqlite3_stmt *st_votes;
-        sqlite3_prepare_v2(db,
-            "SELECT COUNT(*) FROM votes;",
-            -1, &st_votes, nullptr);
-        
+        sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM votes;", -1, &st_votes, nullptr);
         int total_votes = 0;
-        if (sqlite3_step(st_votes) == SQLITE_ROW) {
+        if (sqlite3_step(st_votes) == SQLITE_ROW)
             total_votes = sqlite3_column_int(st_votes, 0);
-        }
         sqlite3_finalize(st_votes);
         
-        // Build JSON response
         std::ostringstream js;
         js << "{ \"ok\": true, \"results\": {";
         bool first = true;
@@ -1202,7 +1378,6 @@ int main() {
             first = false;
             js << "\"" << p.first << "\": " << p.second;
         }
-        
         js << "}, \"physical_votes\": {";
         first = true;
         for (auto &p : physical_results) {
@@ -1210,7 +1385,6 @@ int main() {
             first = false;
             js << "\"" << p.first << "\": " << p.second;
         }
-        
         js << "}, \"online_votes\": {";
         first = true;
         for (auto &p : online_results) {
@@ -1218,12 +1392,11 @@ int main() {
             first = false;
             js << "\"" << p.first << "\": " << p.second;
         }
-        
         js << "}, \"stats\": { ";
         js << "\"total_voters\": " << total_voters;
         js << ", \"total_votes\": " << total_votes;
-        js << ", \"participation\": " << (total_voters > 0 ? 
-             (total_votes * 100.0 / total_voters) : 0);
+        js << ", \"participation\": " << (total_voters > 0 ?
+            (total_votes * 100.0 / total_voters) : 0);
         js << "} }";
         
         res.set_header("Content-Type", "application/json");
@@ -1255,91 +1428,264 @@ int main() {
     //
     // ADMIN ENDPOINTS (would require proper role-based access control in production)
     //
+
+    svr.Get("/admin", [&](const Request &req, Response &res) {
+    if(!require_admin(req, res)) return;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(db, "SELECT id, user, email FROM users;", -1, &st, nullptr) != SQLITE_OK) {
+        return json_res(res, false, "Database error");
+    }
+    std::ostringstream out;
+    out << "{ \"ok\": true, \"users\": [";
+    bool first = true;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        if (!first) out << ", ";
+        first = false;
+        int id = sqlite3_column_int(st, 0);
+        std::string user = reinterpret_cast<const char*>(sqlite3_column_text(st, 1));
+        std::string email = reinterpret_cast<const char*>(sqlite3_column_text(st, 2));
+        out << "{ \"id\": " << id << ", \"user\": \"" << user 
+            << "\", \"email\": \"" << email << "\" }";
+    }
+    out << "] }";
+    sqlite3_finalize(st);
+    res.set_header("Content-Type", "application/json");
+    res.set_content(out.str(), "application/json");
+});
+
+    // Add these to your main function before svr.listen():
+
+    // Get election settings
+    svr.Get("/admin/election-settings", [&](const Request& req, Response &res) {
+    if(!require_admin(req, res)) return;
+    sqlite3_stmt *st;
+    sqlite3_prepare_v2(db, "SELECT id, name, party FROM candidates;", -1, &st, nullptr);
+    std::ostringstream out;
+    out << "{ \"ok\": true, \"candidates\": [";
+    bool first = true;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        if (!first) out << ", ";
+        first = false;
+        int id = sqlite3_column_int(st, 0);
+        std::string name = reinterpret_cast<const char*>(sqlite3_column_text(st, 1));
+        std::string party = reinterpret_cast<const char*>(sqlite3_column_text(st, 2));
+        out << "{ \"id\": " << id << ", \"name\": \"" << name
+            << "\", \"party\": \"" << party << "\" }";
+    }
+    sqlite3_finalize(st);
+    
+    // Determine if voting is currently open based on election dates
+    std::time_t now = std::time(nullptr);
+    std::tm start_tm = {};
+    std::tm end_tm = {};
+    std::istringstream start_ss(election_start);
+    std::istringstream end_ss(election_end);
+    
+    // Parse date strings to time structures (assuming format like "2025-05-18T12:00:00")
+    start_ss >> std::get_time(&start_tm, "%Y-%m-%dT%H:%M:%S");
+    end_ss >> std::get_time(&end_tm, "%Y-%m-%dT%H:%M:%S");
+    
+    std::time_t start_time = std::mktime(&start_tm);
+    std::time_t end_time = std::mktime(&end_tm);
+    
+    // Check if current time is within election period and if voting is enabled by admin
+    bool is_voting_period = (now >= start_time && now <= end_time);
+    bool voting_currently_open = voting_open && is_voting_period;
+    
+    out << "], \"votingEnabled\": " << (voting_currently_open ? "true" : "false")
+        << ", \"manualVotingEnabled\": " << (voting_open ? "true" : "false")
+        << ", \"electionStart\": \"" << election_start
+        << "\", \"electionEnd\": \"" << election_end
+        << "\", \"currentTime\": " << now
+        << ", \"isWithinElectionPeriod\": " << (is_voting_period ? "true" : "false")
+        << " }";
+    res.set_header("Content-Type", "application/json");
+    res.set_content(out.str(), "application/json");
+});
+
+svr.Get("/election-info", [&](const Request& req, Response &res) {
+    std::ostringstream out;
+
+    bool currentlyOpen = isVotingOpen();
+
+    out << "{ \"ok\": true, "
+        << "\"electionStart\": \"" << election_start << "\", "
+        << "\"electionEnd\": \"" << election_end << "\", "
+        << "\"votingEnabled\": " << (currentlyOpen ? "true" : "false") 
+        << " }";
+
+    res.set_header("Content-Type", "application/json");
+    res.set_content(out.str(), "application/json");
+});
+
+
+    // Add candidate
+    svr.Post("/admin/candidates", [&](const Request& req, Response &res) {
+    if(!require_admin(req, res)) return;
+    auto name = extract_field(req.body, "name");
+    auto party = extract_field(req.body, "party");
+    if (name.empty() || party.empty())
+        return json_res(res, false, "Name and party are required");
+    sqlite3_stmt *st;
+    sqlite3_prepare_v2(db, "INSERT INTO candidates (name, party) VALUES (?, ?);", -1, &st, nullptr);
+    sqlite3_bind_text(st, 1, name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, party.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) != SQLITE_DONE) {
+        sqlite3_finalize(st);
+        return json_res(res, false, "Failed to add candidate");
+    }
+    sqlite3_finalize(st);
+    return json_res(res, true, "Candidate added successfully");
+});
+
+svr.Get("/candidates", [&](const Request&, Response &res) {
+    sqlite3_stmt *st;
+    sqlite3_prepare_v2(db, "SELECT id, name, party FROM candidates;", -1, &st, nullptr);
+    std::ostringstream out;
+    out << "{ \"ok\": true, \"candidates\": [";
+    bool first = true;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        if (!first) out << ", ";
+        first = false;
+        int id = sqlite3_column_int(st, 0);
+        std::string name = reinterpret_cast<const char*>(sqlite3_column_text(st, 1));
+        std::string party = reinterpret_cast<const char*>(sqlite3_column_text(st, 2));
+        out << "{ \"id\": " << id << ", \"name\": \"" << name
+            << "\", \"party\": \"" << party << "\" }";
+    }
+    out << "] }";
+    sqlite3_finalize(st);
+    res.set_header("Content-Type", "application/json");
+    res.set_content(out.str(), "application/json");
+});
+
+
+
+    // Update election times
+    svr.Post("/admin/election-times", [&](const Request& req, Response &res) {
+    if (!require_admin(req, res)) return;
+    auto start = extract_field(req.body, "start");
+    auto end = extract_field(req.body, "end");
+    if (start.empty() || end.empty())
+        return json_res(res, false, "Start and end times are required");
+
+    // Update in-memory values
+    election_start = start;
+    election_end = end;
+
+    // Persist to DB
+    sqlite3_exec(db, "BEGIN TRANSACTION;", nullptr, nullptr, nullptr);
+
+    sqlite3_stmt *st1;
+    sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO config(key, value) VALUES('election_start', ?);", -1, &st1, nullptr);
+    sqlite3_bind_text(st1, 1, start.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(st1);
+    sqlite3_finalize(st1);
+
+    sqlite3_stmt *st2;
+    sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO config(key, value) VALUES('election_end', ?);", -1, &st2, nullptr);
+    sqlite3_bind_text(st2, 1, end.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(st2);
+    sqlite3_finalize(st2);
+
+    sqlite3_exec(db, "COMMIT;", nullptr, nullptr, nullptr);
+
+    return json_res(res, true, "Election times updated successfully");
+});
+
+// POST /admin/toggle-voting
+svr.Post("/admin/toggle-voting", [&](const Request& req, Response &res) {
+    if (!require_admin(req, res)) return;
+
+    voting_open = !voting_open;
+
+    // Persist voting state
+    sqlite3_stmt *st;
+    sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO config(key, value) VALUES('voting_open', ?);", -1, &st, nullptr);
+    sqlite3_bind_text(st, 1, voting_open ? "1" : "0", -1, SQLITE_TRANSIENT);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+
+    return json_res(res, true, std::string("Voting is now ") + (voting_open ? "open" : "closed"));
+});
+    
     
     // Import physical votes
     svr.Post("/admin/import-physical", [&](const Request& req, Response &res) {
-        // In a real system, this would be protected by admin authentication
-        
-        auto filepath = extract_field(req.body, "filepath");
-        if (filepath.empty()) {
-            return json_res(res, false, "Filepath required");
-        }
-        
-        if (import_physical_votes(db, filepath)) {
-            return json_res(res, true, "Physical votes imported successfully");
-        } else {
-            return json_res(res, false, "Failed to import physical votes");
-        }
-    });
+    // In production, protect this endpoint with admin authentication.
+    auto filepath = extract_field(req.body, "filepath");
+    if (filepath.empty()) {
+        return json_res(res, false, "Filepath required");
+    }
+    
+    if (import_physical_votes(db, filepath)) {
+        return json_res(res, true, "Physical votes imported successfully");
+    } else {
+        return json_res(res, false, "Failed to import physical votes");
+    }
+});
     
     // Register valid voters
     svr.Post("/admin/register-voters", [&](const Request& req, Response &res) {
-        // In a real system, this would be protected by admin authentication
-        
-        auto filepath = extract_field(req.body, "filepath");
-        if (filepath.empty()) {
-            return json_res(res, false, "Filepath required");
-        }
-        
-        std::ifstream file(filepath);
-        if (!file.is_open()) {
-            return json_res(res, false, "Could not open file");
-        }
-        
-        // Begin transaction
-        sqlite3_exec(db, "BEGIN TRANSACTION;", nullptr, nullptr, nullptr);
-        
-        std::string line;
-        int count = 0;
-        
-        // Skip header line
-        std::getline(file, line);
-        
-        while (std::getline(file, line)) {
-            std::stringstream ss(line);
-            std::string idnp, name, area;
-            
-            std::getline(ss, idnp, ',');
-            std::getline(ss, name, ',');
-            std::getline(ss, area, ',');
-            
-            // Validate IDNP
-            if (idnp.length() != 13) {
-                continue;
-            }
-            
-            // Insert voter
-            sqlite3_stmt *st;
-            sqlite3_prepare_v2(db,
-                "INSERT OR IGNORE INTO valid_voters(idnp, name, voting_area) VALUES(?, ?, ?);",
-                -1, &st, nullptr);
-            
-            sqlite3_bind_text(st, 1, idnp.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(st, 2, name.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(st, 3, area.c_str(), -1, SQLITE_TRANSIENT);
-            
-            if (sqlite3_step(st) == SQLITE_DONE) {
-                count++;
-            }
-            sqlite3_finalize(st);
-        }
-        
-        // Commit transaction
-        sqlite3_exec(db, "COMMIT;", nullptr, nullptr, nullptr);
-        
-        return json_res(res, true, "Registered " + std::to_string(count) + " voters");
-    });
+    // In production, protect this endpoint with admin authentication.
+    auto filepath = extract_field(req.body, "filepath");
+    if (filepath.empty()) {
+        return json_res(res, false, "Filepath required");
+    }
     
-    // Toggle voting status
-    svr.Post("/admin/toggle-voting", [&](const Request& req, Response &res) {
-        // In a real system, this would be protected by admin authentication
+    std::ifstream file(filepath);
+    if (!file.is_open()) {
+        return json_res(res, false, "Could not open file");
+    }
+    
+    // Begin transaction
+    sqlite3_exec(db, "BEGIN TRANSACTION;", nullptr, nullptr, nullptr);
+    
+    std::string line;
+    int count = 0;
+    
+    // Skip header line
+    std::getline(file, line);
+    
+    while (std::getline(file, line)) {
+        std::stringstream ss(line);
+        std::string idnp, name, area;
         
-        voting_open = !voting_open;
-        return json_res(res, true, 
-            std::string("Voting is now ") + (voting_open ? "open" : "closed"));
-    });
+        std::getline(ss, idnp, ',');
+        std::getline(ss, name, ',');
+        std::getline(ss, area, ',');
+        
+        // Validate IDNP length (should be 13)
+        if (idnp.length() != 13) continue;
+        
+        sqlite3_stmt *st;
+        sqlite3_prepare_v2(db,
+            "INSERT OR IGNORE INTO valid_voters(idnp, name, voting_area) VALUES(?, ?, ?);",
+            -1, &st, nullptr);
+        sqlite3_bind_text(st, 1, idnp.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, name.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 3, area.c_str(), -1, SQLITE_TRANSIENT);
+        
+        if (sqlite3_step(st) == SQLITE_DONE) {
+            count++;
+        }
+        sqlite3_finalize(st);
+    }
+    
+    // Commit transaction
+    sqlite3_exec(db, "COMMIT;", nullptr, nullptr, nullptr);
+    
+    return json_res(res, true, "Registered " + std::to_string(count) + " voters");
+});
+    
+    
+
 
     std::cout << "Secure Voting Server listening on http://localhost:8080\n";
+        // Add this before svr.listen(...)
+    svr.Get("/health", [](const Request&, Response &res) {
+        res.set_content("OK", "text/plain");
+    });
     svr.listen("0.0.0.0", 8080);
 
     sqlite3_close(db);
